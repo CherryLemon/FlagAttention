@@ -79,8 +79,13 @@ def op():
         empty=lambda shape, dtype, device: TensorMetadata(shape, dtype, device),
         _C=SimpleNamespace(_overlaps=lambda x, y: x.storage == y.storage),
     )
-    module._paged_sparse_kernel = LaunchRecorder()
-    module._merge_paged_sparse_kernel = LaunchRecorder()
+    module.kernels = SimpleNamespace(
+        _gqa_sparse_fwd_fallback_kernel=LaunchRecorder(),
+        _gqa_sparse_decode_kernel=LaunchRecorder(),
+        _merge_topk_attn_out_kernel=LaunchRecorder(),
+        current_platform=SimpleNamespace(is_arch_support_pdl=lambda: False),
+    )
+    module._kernel_module = lambda: module.kernels
     return module
 
 
@@ -106,12 +111,14 @@ def test_prefill_launch_has_separate_cache_pointers(op, page_size):
     result = op.minimax_m3_sparse_attn_paged(
         **args, cu_seqlens_q=cu, prefix_lens=prefix, max_query_len=1
     )
-    grid, buffers, meta = op._paged_sparse_kernel.calls[0]
+    grid, buffers, meta = op.kernels._gqa_sparse_fwd_fallback_kernel.calls[0]
     assert result is args["output"]
-    assert grid == (1, 4, 1)
-    assert buffers[1] is args["k_cache"] and buffers[2] is args["v_cache"]
-    assert meta["PAGE_SIZE"] == page_size
-    assert not op._merge_paged_sparse_kernel.calls
+    assert grid == (1, 1, 4)
+    assert buffers[1] is args["k_cache"]
+    assert meta["v_cache_ptr"] is args["v_cache"]
+    assert meta["KV_LAYOUT"][0] == page_size
+    assert not op.kernels._gqa_sparse_decode_kernel.calls
+    assert not op.kernels._merge_topk_attn_out_kernel.calls
 
 
 @pytest.mark.parametrize(
@@ -123,39 +130,79 @@ def test_decode_workspace_and_shape_only_splits(op, t, qlen, topk, splits):
     result = op.minimax_m3_sparse_attn_decode_paged(
         **args, decode_query_len=qlen, workspace=scratch
     )
-    grid, buffers, meta = op._paged_sparse_kernel.calls[0]
+    grid, buffers, meta = op.kernels._gqa_sparse_decode_kernel.calls[0]
     assert result is args["output"]
-    assert grid == (t, 1, splits)
-    assert meta["DECODE"] and meta["QLEN"] == qlen
+    assert grid == (t * splits, 1)
+    assert meta["NUM_TOPK_CHUNKS"] == splits and buffers[14] == qlen
     assert scratch[0].shape == (splits, t, 8, 128)
-    assert scratch[0].dtype == torch.float32
+    assert scratch[0].dtype == args["q"].dtype
     if splits > 1:
-        assert buffers[8] is scratch[0] and buffers[9] is scratch[1]
-        assert op._merge_paged_sparse_kernel.calls[0][0] == (t, 8)
+        assert buffers[5] is scratch[0] and buffers[6] is scratch[1]
+        assert op.kernels._merge_topk_attn_out_kernel.calls[0][0] == (t, 8)
     else:
-        assert not op._merge_paged_sparse_kernel.calls
+        assert not meta["STORE_LSE"]
+        assert not op.kernels._merge_topk_attn_out_kernel.calls
 
 
 def test_empty_has_no_launch(op):
     args = inputs(t=0, batch=0)
     assert op.minimax_m3_sparse_attn_decode_paged(**args) is args["output"]
-    assert not op._paged_sparse_kernel.calls
+    assert not op.kernels._gqa_sparse_decode_kernel.calls
 
 
 def test_scale_tensor_is_forwarded_without_readback(op):
     args = inputs()
     scale = TensorMetadata((), torch.float32)
     op.minimax_m3_sparse_attn_decode_paged(**args, k_scale=scale, v_scale=0.5)
-    _, buffers, meta = op._paged_sparse_kernel.calls[0]
-    assert buffers[11] is scale
+    _, buffers, meta = op.kernels._gqa_sparse_decode_kernel.calls[0]
+    assert buffers[2] is scale
     assert meta["K_SCALE_PTR"] and not meta["V_SCALE_PTR"]
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_pdl_is_shared_by_decode_and_merge_only_when_supported(op, supported):
+    op.kernels.current_platform.is_arch_support_pdl = lambda: supported
+    op.minimax_m3_sparse_attn_decode_paged(**inputs())
+    for kernel in (
+        op.kernels._gqa_sparse_decode_kernel,
+        op.kernels._merge_topk_attn_out_kernel,
+    ):
+        meta = kernel.calls[0][2]
+        assert meta["USE_PDL"] is supported
+        if supported:
+            assert meta["launch_pdl"] is True
+        else:
+            assert "launch_pdl" not in meta
+
+
+def test_single_split_does_not_query_pdl_capability(op):
+    def fail():
+        raise AssertionError("Single split has no dependent merge")
+
+    op.kernels.current_platform.is_arch_support_pdl = fail
+    op.minimax_m3_sparse_attn_decode_paged(**inputs(t=256, batch=256))
+    assert not op.kernels._gqa_sparse_decode_kernel.calls[0][2]["USE_PDL"]
+
+
+def test_prefill_preserves_independent_v_and_table_strides(op):
+    a = inputs(page_size=16)
+    a["v_cache"].strides = (4096, 256, 128, 2)
+    a["block_table"].strides = (64, 2)
+    op.minimax_m3_sparse_attn_paged(
+        **a,
+        cu_seqlens_q=TensorMetadata((5,), torch.int32),
+        prefix_lens=TensorMetadata((4,), torch.int32),
+        max_query_len=1,
+    )
+    meta = op.kernels._gqa_sparse_fwd_fallback_kernel.calls[0][2]
+    assert meta["KV_LAYOUT"] == (16, 16, 16, 2, 4096, 128, 256, 2)
 
 
 @pytest.mark.parametrize("scale", [0, -1, float("inf"), float("nan"), True])
 def test_invalid_scale_fails_before_launch(op, scale):
     with pytest.raises(ValueError if not isinstance(scale, bool) else TypeError):
         op.minimax_m3_sparse_attn_decode_paged(**inputs(), k_scale=scale)
-    assert not op._paged_sparse_kernel.calls
+    assert not op.kernels._gqa_sparse_decode_kernel.calls
 
 
 @pytest.mark.parametrize(
@@ -192,7 +239,7 @@ def test_invalid_contract_fails_before_launch(op, change, error):
         extras["decode_query_len"] = 2
     with pytest.raises(error):
         op.minimax_m3_sparse_attn_decode_paged(**args, **extras)
-    assert not op._paged_sparse_kernel.calls
+    assert not op.kernels._gqa_sparse_decode_kernel.calls
 
 
 def test_noncontiguous_request_metadata_rejected(op):

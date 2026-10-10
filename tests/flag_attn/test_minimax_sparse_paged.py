@@ -101,6 +101,75 @@ def test_empty_selected_blocks_zero_output():
 
 
 @pytest.mark.parametrize("decode", [False, True])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_separate_cache_matches_existing_packed_interface(decode, kv_dtype):
+    from flag_attn import (
+        minimax_m3_sparse_attn,
+        minimax_m3_sparse_attn_decode,
+        minimax_m3_sparse_attn_decode_paged,
+        minimax_m3_sparse_attn_paged,
+    )
+    from flag_attn.testing.minimax_sparse_paged import make_sparse_paged_inputs
+
+    a = make_sparse_paged_inputs(2, 2, 513, 128, torch.bfloat16, kv_dtype=kv_dtype)
+    # Packing is test-only; production adapters preserve the original storage.
+    packed = (
+        torch.cat((a["k_cache"], a["v_cache"]), -1).permute(0, 2, 1, 3).contiguous()
+    )
+    expected = torch.empty_like(a["q"])
+    scales = (
+        dict(
+            k_scale=torch.tensor(0.5, device="cuda"),
+            v_scale=torch.tensor(1.5, device="cuda"),
+        )
+        if kv_dtype == torch.float8_e4m3fn
+        else {}
+    )
+    if decode:
+        minimax_m3_sparse_attn_decode(
+            a["q"],
+            packed,
+            a["topk_idx"],
+            a["block_table"],
+            a["seq_lens"],
+            1,
+            a["sm_scale"],
+            expected,
+            2,
+            **scales,
+        )
+        result = minimax_m3_sparse_attn_decode_paged(
+            a["q"],
+            a["k_cache"],
+            a["v_cache"],
+            a["topk_idx"],
+            a["block_table"],
+            a["seq_lens"],
+            a["sm_scale"],
+            a["output"],
+            2,
+            **scales,
+        )
+    else:
+        minimax_m3_sparse_attn(
+            a["q"],
+            packed,
+            a["topk_idx"],
+            a["block_table"],
+            a["cu_seqlens_q"],
+            a["seq_lens"],
+            a["prefix_lens"],
+            a["max_query_len"],
+            1,
+            a["sm_scale"],
+            expected,
+            **scales,
+        )
+        result = minimax_m3_sparse_attn_paged(**a, **scales)
+    torch.testing.assert_close(result, expected, rtol=0.02, atol=0.02)
+
+
+@pytest.mark.parametrize("decode", [False, True])
 def test_graph_replay_refreshes_metadata(decode):
     from flag_attn import (
         minimax_m3_sparse_attn_decode_paged,

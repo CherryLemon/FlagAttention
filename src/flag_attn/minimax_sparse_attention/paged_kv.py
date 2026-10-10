@@ -5,14 +5,14 @@
 Logical sparse blocks contain 128 tokens. Physical KV pages may have a
 different size. Callers provide logical block IDs, physical page tables and
 device sequence metadata; no cache packing or framework imports are needed.
-This initial path uses conservative fixed launch settings, pending GPU tuning.
+The existing sparse_attn prefill/decode/merge kernels perform the attention;
+this module only validates and dispatches the separate-cache interface.
 """
 
 import math
 
 import torch
 import triton
-import triton.language as tl
 
 __all__ = [
     "minimax_m3_sparse_attn_paged",
@@ -27,170 +27,11 @@ _FLOAT8 = tuple(
 )
 
 
-@triton.jit
-def _paged_sparse_kernel(
-    Q,
-    K,
-    V,
-    TopK,
-    Pages,
-    CuQ,
-    Seq,
-    Prefix,
-    Out,
-    Lse,
-    QScale,
-    KScale,
-    VScale,
-    T: tl.constexpr,
-    HQ: tl.constexpr,
-    HK: tl.constexpr,
-    D: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    NUM_PAGES: tl.constexpr,
-    PAGE_COLS: tl.constexpr,
-    TOPK: tl.constexpr,
-    DECODE: tl.constexpr,
-    QLEN: tl.constexpr,
-    SPLITS: tl.constexpr,
-    CHUNK: tl.constexpr,
-    SCALE: tl.constexpr,
-    SQ: tl.constexpr,
-    SK: tl.constexpr,
-    SV: tl.constexpr,
-    ST: tl.constexpr,
-    SP: tl.constexpr,
-    SO: tl.constexpr,
-    SL: tl.constexpr,
-    Q_SCALE_PTR: tl.constexpr,
-    K_SCALE_PTR: tl.constexpr,
-    V_SCALE_PTR: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    head_req = tl.program_id(1)
-    split = tl.program_id(2)
-    if DECODE:
-        req = row // QLEN
-        local_q = row % QLEN
-        kh = head_req
-        qidx = row
-        qlen = QLEN
-        seq_len = tl.load(Seq + req)
-        qabs = seq_len - QLEN + local_q
-    else:
-        req = head_req // HK
-        kh = head_req % HK
-        start = tl.load(CuQ + req)
-        qlen = tl.load(CuQ + req + 1) - start
-        local_q = row
-        qidx = start + row
-        seq_len = tl.load(Seq + req)
-        qabs = tl.load(Prefix + req) + local_q
-    if local_q >= qlen or qidx >= T:
-        return
+def _kernel_module():
+    # Lazy import keeps metadata-only calls independent of backend initialization.
+    from . import sparse_attn
 
-    gh = HQ // HK
-    h = kh * gh + tl.arange(0, BLOCK_H)
-    d = tl.arange(0, BLOCK_D)
-    n = tl.arange(0, 128)
-    q = tl.load(
-        Q + qidx * SQ[0] + h[:, None] * SQ[1] + d[None, :] * SQ[2],
-        mask=(h[:, None] < (kh + 1) * gh) & (d[None, :] < D),
-        other=0,
-    )
-    qs = tl.load(QScale) if Q_SCALE_PTR else QScale
-    ks = tl.load(KScale) if K_SCALE_PTR else KScale
-    vs = tl.load(VScale) if V_SCALE_PTR else VScale
-    scale = SCALE * qs * 1.4426950408889634
-    m = tl.full((BLOCK_H,), float("-inf"), tl.float32)
-    norm = tl.zeros((BLOCK_H,), tl.float32)
-    acc = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
-    # Match the indexer's valid-prefix contract; trailing top-k slots need
-    # not be initialized when the number of logical blocks is below TOPK.
-    real_topk = tl.maximum(0, tl.minimum(TOPK, (qabs + 128) // 128))
-    for ti in range(split * CHUNK, tl.minimum((split + 1) * CHUNK, real_topk)):
-        block = tl.load(TopK + kh * ST[0] + qidx * ST[1] + ti * ST[2])
-        pos = block.to(tl.int64) * 128 + n
-        page_col = pos // PAGE_SIZE
-        valid = (block >= 0) & (block < (seq_len + 127) // 128)
-        valid = valid & (pos >= 0) & (pos < seq_len) & (pos <= qabs)
-        valid = valid & (page_col < PAGE_COLS)
-        page = tl.load(Pages + req * SP[0] + page_col * SP[1], mask=valid, other=-1)
-        valid = valid & (page >= 0) & (page < NUM_PAGES)
-        page = tl.where(valid, page, 0).to(tl.int64)
-        offset = pos % PAGE_SIZE
-        k = tl.load(
-            K
-            + page[None, :] * SK[0]
-            + offset[None, :] * SK[1]
-            + kh * SK[2]
-            + d[:, None] * SK[3],
-            mask=valid[None, :] & (d[:, None] < D),
-            other=0.0,
-        )
-        v = tl.load(
-            V
-            + page[:, None] * SV[0]
-            + offset[:, None] * SV[1]
-            + kh * SV[2]
-            + d[None, :] * SV[3],
-            mask=valid[:, None] & (d[None, :] < D),
-            other=0.0,
-        )
-        k = (k.to(tl.float32) * ks).to(q.dtype)
-        v = (v.to(tl.float32) * vs).to(q.dtype)
-        scores = tl.dot(q, k) * scale
-        scores = tl.where(valid[None, :], scores, float("-inf"))
-        m_new = tl.maximum(m, tl.max(scores, 1))
-        safe_m = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.exp2(m - safe_m)
-        p = tl.exp2(scores - safe_m[:, None])
-        acc = acc * alpha[:, None] + tl.dot(p.to(q.dtype), v)
-        norm = norm * alpha + tl.sum(p, 1)
-        m = m_new
-    acc = acc / tl.where(norm > 0, norm, 1.0)[:, None]
-    tl.store(
-        Out + split * SO[0] + qidx * SO[1] + h[:, None] * SO[2] + d[None, :] * SO[3],
-        acc,
-        mask=(h[:, None] < (kh + 1) * gh) & (d[None, :] < D),
-    )
-    if SPLITS > 1:
-        lse = tl.where(norm > 0, m + tl.log2(norm), float("-inf"))
-        tl.store(
-            Lse + split * SL[0] + qidx * SL[1] + h * SL[2], lse, mask=h < (kh + 1) * gh
-        )
-
-
-@triton.jit
-def _merge_paged_sparse_kernel(
-    Partial,
-    Lse,
-    Out,
-    SPLITS: tl.constexpr,
-    D: tl.constexpr,
-    SP: tl.constexpr,
-    SL: tl.constexpr,
-    SO: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    head = tl.program_id(1)
-    s = tl.arange(0, SPLITS)
-    d = tl.arange(0, BLOCK_D)
-    lse = tl.load(Lse + s * SL[0] + row * SL[1] + head * SL[2])
-    m = tl.max(lse, 0)
-    safe_m = tl.where(m == float("-inf"), 0.0, m)
-    w = tl.exp2(lse - safe_m)
-    denom = tl.sum(w, 0)
-    partial = tl.load(
-        Partial + s[:, None] * SP[0] + row * SP[1] + head * SP[2] + d[None, :] * SP[3],
-        mask=d[None, :] < D,
-        other=0,
-    )
-    out = tl.sum(partial * w[:, None], 0) / tl.where(denom > 0, denom, 1.0)
-    tl.store(Out + row * SO[0] + head * SO[1] + d * SO[2], out, mask=d < D)
+    return sparse_attn
 
 
 def _tensor(tensor, name, shape, dtypes, device):
@@ -292,7 +133,7 @@ def _splits(total_q, kv_heads, topk):
 
 
 def minimax_m3_sparse_decode_workspace(q, num_kv_heads, topk):
-    """Allocate reusable FP32 partial/LSE buffers before Graph capture.
+    """Allocate reusable Q-dtype partials and FP32 LSE before Graph capture.
 
     Size depends only on tensor shapes. Caller must not share this workspace
     between concurrent streams or launches that may overlap.
@@ -312,7 +153,7 @@ def minimax_m3_sparse_decode_workspace(q, num_kv_heads, topk):
     _tensor(q, "q", q.shape, (torch.float16, torch.bfloat16), q.device)
     splits = _splits(q.shape[0], num_kv_heads, topk)
     return (
-        torch.empty((splits,) + tuple(q.shape), dtype=torch.float32, device=q.device),
+        torch.empty((splits,) + tuple(q.shape), dtype=q.dtype, device=q.device),
         torch.empty(
             (splits,) + tuple(q.shape[:2]), dtype=torch.float32, device=q.device
         ),
@@ -355,9 +196,7 @@ def _launch(
         if not isinstance(workspace, (tuple, list)) or len(workspace) != 2:
             raise ValueError("workspace must be (partial_output, partial_lse)")
         partial, lse = workspace
-        _tensor(
-            partial, "partial_output", (splits, t, h, d), (torch.float32,), q.device
-        )
+        _tensor(partial, "partial_output", (splits, t, h, d), (q.dtype,), q.device)
         _tensor(lse, "partial_lse", (splits, t, h), (torch.float32,), q.device)
         tensors = (q, k, v, topk, pages, seq, cu, prefix, output)
         tensors += tuple(x for x in (qs, ks, vs) if isinstance(x, torch.Tensor))
@@ -365,62 +204,117 @@ def _launch(
         _disjoint(lse, tensors)
     else:
         partial, lse = output.unsqueeze(0), output
-    grid = (t, hk, splits) if decode else (max_query_len, seq.shape[0] * hk, 1)
-    _paged_sparse_kernel[grid](
-        q,
-        k,
-        v,
-        topk,
-        pages,
-        cu,
-        seq,
-        prefix,
-        partial,
-        lse,
-        qs,
-        ks,
-        vs,
-        T=t,
-        HQ=h,
-        HK=hk,
-        D=d,
-        PAGE_SIZE=page_size,
-        NUM_PAGES=k.shape[0],
-        PAGE_COLS=pages.shape[1],
-        TOPK=topk.shape[-1],
-        DECODE=decode,
-        QLEN=decode_query_len or 1,
-        SPLITS=splits,
-        CHUNK=triton.cdiv(topk.shape[-1], splits),
-        SCALE=float(sm_scale),
-        SQ=q.stride(),
-        SK=k.stride(),
-        SV=v.stride(),
-        ST=topk.stride(),
-        SP=pages.stride(),
-        SO=partial.stride(),
-        SL=lse.stride() if splits > 1 else (0, 0, 0),
+    kernels = _kernel_module()
+    layout = (
+        page_size,
+        k.shape[0],
+        pages.shape[1],
+        pages.stride(1),
+        v.stride(0),
+        v.stride(2),
+        v.stride(1),
+        v.stride(3),
+    )
+    options = dict(
+        v_cache_ptr=v,
+        KV_LAYOUT=layout,
+        q_scale=qs,
         Q_SCALE_PTR=qp,
         K_SCALE_PTR=kp,
         V_SCALE_PTR=vp,
-        BLOCK_H=max(16, triton.next_power_of_2(h // hk)),
-        BLOCK_D=triton.next_power_of_2(d),
+        BLOCK_SIZE_K=128,
+        BLOCK_SIZE_D=triton.next_power_of_2(d),
+        BLOCK_SIZE_H=max(16, triton.next_power_of_2(h // hk)),
+        USE_FP8=k.dtype in _FLOAT8,
+        KV_SCALE_MODE=1,
         num_warps=4,
         num_stages=1,
     )
-    if splits > 1:
-        _merge_paged_sparse_kernel[(t, h)](
+    strides = (
+        *q.stride(),
+        k.stride(0),
+        k.stride(2),
+        k.stride(1),
+        k.stride(3),
+        0,
+        0,
+        0,
+        0,
+        *topk.stride(),
+    )
+    if not decode:
+        # Separate buffers cannot use the packed-KV TMA descriptor. Reuse the
+        # existing pointer-based prefill path instead of packing the cache.
+        kernels._gqa_sparse_fwd_fallback_kernel[(max_query_len, hk, seq.shape[0])](
+            q,
+            k,
+            ks,
+            vs,
+            topk,
+            output,
+            pages,
+            cu,
+            cu,
+            seq,
+            prefix,
+            hk,
+            h // hk,
+            d,
+            topk.shape[-1],
+            1,
+            float(sm_scale),
+            *strides,
+            *output.stride(),
+            pages.stride(0),
+            BLOCK_SIZE_Q=1,
+            BLOCK_SIZE_QH=options["BLOCK_SIZE_H"],
+            **options,
+        )
+    else:
+        # Keep the existing split-K and PDL scheduling. A single split writes
+        # directly to output and does not need an LSE store or merge launch.
+        use_pdl = splits > 1 and kernels.current_platform.is_arch_support_pdl()
+        if use_pdl:
+            options["launch_pdl"] = True
+        kernels._gqa_sparse_decode_kernel[(t * splits, hk)](
+            q,
+            k,
+            ks,
+            vs,
+            topk,
             partial,
             lse,
-            output,
-            SPLITS=splits,
-            D=d,
-            SP=partial.stride(),
-            SL=lse.stride(),
-            SO=output.stride(),
-            BLOCK_D=triton.next_power_of_2(d),
-            num_warps=4,
+            pages,
+            seq,
+            t,
+            h // hk,
+            d,
+            topk.shape[-1],
+            float(sm_scale),
+            decode_query_len,
+            *strides,
+            *partial.stride(),
+            *(lse.stride() if splits > 1 else (0, 0, 0)),
+            pages.stride(0),
+            NUM_TOPK_CHUNKS=splits,
+            USE_PDL=use_pdl,
+            STORE_LSE=splits > 1,
+            **options,
         )
+        if splits > 1:
+            kernels._merge_topk_attn_out_kernel[(t, h)](
+                partial,
+                lse,
+                output,
+                d,
+                *partial.stride(),
+                *lse.stride(),
+                *output.stride(),
+                NUM_TOPK_CHUNKS=splits,
+                BLOCK_SIZE_D=options["BLOCK_SIZE_D"],
+                USE_PDL=use_pdl,
+                **({"launch_pdl": True} if use_pdl else {}),
+            )
     return output
 
 

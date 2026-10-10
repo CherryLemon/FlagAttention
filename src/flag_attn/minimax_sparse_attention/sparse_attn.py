@@ -20,9 +20,13 @@ The main heads attend only to the blocks selected by the lightning indexer (see
 equal the sparse block size (128), so one selected block maps to exactly one
 page.
 
-Main K/V cache layout (vLLM):
+Packed K/V cache layout:
   ``(num_blocks, num_kv_heads, 128, 2 * head_dim)``
   K=[..., :head_dim] V=[..., head_dim:]
+
+The pointer-based prefill and decode kernels also accept separate K/V buffers
+and physical page sizes different from 128 through ``paged_kv``. The packed
+interface retains its existing TMA/TLE prefill path.
 
 Only the paths MiniMax M3 uses are implemented: no attention sink, base-2
 (exp2/log2) softmax. The decode kernels use split-K (flash-decoding) over the
@@ -56,12 +60,54 @@ _FP8_DTYPES = (
 )
 
 
+@triton.jit
+def _scalar_scale(value, IS_POINTER: tl.constexpr):
+    if IS_POINTER:
+        return tl.load(value)
+    else:
+        return value
+
+
+@triton.jit
+def _paged_sparse_block(
+    bt_row,
+    block,
+    seq_len,
+    query_pos,
+    BLOCK_SIZE_K: tl.constexpr,
+    KV_LAYOUT: tl.constexpr,
+):
+    # KV_LAYOUT: page size/count, table width/column stride, V strides.
+    n = tl.arange(0, BLOCK_SIZE_K)
+    pos = block.to(tl.int64) * BLOCK_SIZE_K + n
+    valid = (block >= 0) & (pos >= 0) & (pos < seq_len) & (pos <= query_pos)
+    page_col = pos // KV_LAYOUT[0]
+    valid &= page_col < KV_LAYOUT[2]
+    if KV_LAYOUT[0] == BLOCK_SIZE_K:
+        # One table lookup per selected block for the usual 128-token pages.
+        page = tl.load(
+            bt_row + block.to(tl.int64) * KV_LAYOUT[3],
+            mask=(block >= 0) & (block < KV_LAYOUT[2]),
+            other=-1,
+        ).to(tl.int64)
+    else:
+        page = tl.load(
+            bt_row + page_col * KV_LAYOUT[3],
+            mask=valid,
+            other=-1,
+        ).to(tl.int64)
+    valid &= (page >= 0) & (page < KV_LAYOUT[1])
+    return tl.where(valid, page, 0), pos % KV_LAYOUT[0], valid
+
+
 @triton.heuristics(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
-        "BLOCK_SIZE_H": lambda args: triton.next_power_of_2(args["gqa_group_size"]),
-        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"]
-        * triton.next_power_of_2(args["gqa_group_size"]),
+        "BLOCK_SIZE_H": lambda args: max(
+            16 if args.get("KV_LAYOUT") is not None else 1,
+            triton.next_power_of_2(args["gqa_group_size"]),
+        ),
+        "BLOCK_SIZE_QH": lambda args: args["BLOCK_SIZE_Q"] * args["BLOCK_SIZE_H"],
     }
 )
 @triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
@@ -108,6 +154,12 @@ def _gqa_sparse_fwd_fallback_kernel(
     BLOCK_SIZE_QH: tl.constexpr,
     USE_FP8: tl.constexpr,
     KV_SCALE_MODE: tl.constexpr,
+    v_cache_ptr=None,
+    KV_LAYOUT: tl.constexpr = None,
+    q_scale=1.0,
+    Q_SCALE_PTR: tl.constexpr = False,
+    K_SCALE_PTR: tl.constexpr = True,
+    V_SCALE_PTR: tl.constexpr = True,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -130,7 +182,7 @@ def _gqa_sparse_fwd_fallback_kernel(
         t_ptr_j = t_ptr + (q_block_start + pid_q_j) * stride_tn + pid_kh * stride_th
         q_abs = prefix_len + pid_q_j * BLOCK_SIZE_Q
         valid_blocks = (q_abs + BLOCK_SIZE_K) // BLOCK_SIZE_K
-        real_topk = tl.minimum(max_topk, valid_blocks)
+        real_topk = tl.maximum(0, tl.minimum(max_topk, valid_blocks))
         q_ptrs = tl.make_block_ptr(
             base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
             shape=(q_len, gqa_group_size, head_dim),
@@ -150,27 +202,49 @@ def _gqa_sparse_fwd_fallback_kernel(
         l_i = tl.zeros((BLOCK_SIZE_QH,), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
         q = tl.reshape(q, BLOCK_SIZE_QH, BLOCK_SIZE_D)
+        if KV_LAYOUT is not None:
+            q = (q.to(tl.float32) * _scalar_scale(q_scale, Q_SCALE_PTR)).to(q.dtype)
         for _ in range(real_topk):
             blk = tl.load(t_ptr_j).to(tl.int32)
             t_ptr_j = t_ptr_j + stride_tk
             c = blk * BLOCK_SIZE_K
-            page = tl.load(bt_row + blk).to(tl.int64)
-            pos = c + off_n
-            pos_mask = pos < seq_len
-            k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
-            k_ptrs = tl.make_block_ptr(
-                base=k_base_ptr,
-                shape=(head_dim, BLOCK_SIZE_K),
-                strides=(stride_kv_d, stride_kv_pos),
-                offsets=(0, 0),
-                block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
-                order=(0, 1),
-            )
-            k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
-            if USE_FP8:
+            if KV_LAYOUT is not None:
+                page, page_offset, pos_mask = _paged_sparse_block(
+                    bt_row,
+                    blk,
+                    seq_len,
+                    q_abs,
+                    BLOCK_SIZE_K,
+                    KV_LAYOUT,
+                )
+                off_d = tl.arange(0, BLOCK_SIZE_D)
+                k = tl.load(
+                    kv_cache_ptr
+                    + page[None, :] * stride_kv_blk
+                    + pid_kh * stride_kv_h
+                    + page_offset[None, :] * stride_kv_pos
+                    + off_d[:, None] * stride_kv_d,
+                    mask=pos_mask[None, :] & (off_d[:, None] < head_dim),
+                    other=0.0,
+                )
+            else:
+                page = tl.load(bt_row + blk).to(tl.int64)
+                pos = c + off_n
+                pos_mask = pos < seq_len
+                k_base_ptr = kv_cache_ptr + page * stride_kv_blk + pid_kh * stride_kv_h
+                k_ptrs = tl.make_block_ptr(
+                    base=k_base_ptr,
+                    shape=(head_dim, BLOCK_SIZE_K),
+                    strides=(stride_kv_d, stride_kv_pos),
+                    offsets=(0, 0),
+                    block_shape=(BLOCK_SIZE_D, BLOCK_SIZE_K),
+                    order=(0, 1),
+                )
+                k = tl.load(k_ptrs, boundary_check=(0, 1), padding_option="zero")
+            if USE_FP8 or KV_LAYOUT is not None:
                 k = k.to(q.dtype)
                 if KV_SCALE_MODE == 1:
-                    k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                    k = (k * _scalar_scale(k_scale_ptr, K_SCALE_PTR)).to(q.dtype)
                 elif KV_SCALE_MODE == 2:
                     k_scale = tl.load(
                         k_scale_ptr
@@ -182,35 +256,48 @@ def _gqa_sparse_fwd_fallback_kernel(
                     k = (k * k_scale[None, :]).to(q.dtype)
             is_full_causal = (c + BLOCK_SIZE_K) <= q_abs
             is_full_seq = (c + BLOCK_SIZE_K) <= seq_len
-            qk = tl.zeros(
-                (BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32
-            )
+            qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             if not is_full_causal:
                 qk += tl.where(off_q[:, None, :] >= c, 0, float("-inf"))
             qk = tl.reshape(qk, BLOCK_SIZE_QH, BLOCK_SIZE_K)
             qk += tl.dot(q, k) * sm_scale_log2e
-            if not is_full_seq:
+            if KV_LAYOUT is not None or not is_full_seq:
                 qk += tl.where(pos_mask[None, :], 0, float("-inf"))
             m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-            p = tl.exp2(qk - m_ij[:, None])
+            if KV_LAYOUT is not None:
+                safe_m = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+            else:
+                safe_m = m_ij
+            p = tl.exp2(qk - safe_m[:, None])
             l_ij = tl.sum(p, axis=1)
-            alpha = tl.exp2(m_i - m_ij)
+            alpha = tl.exp2(m_i - safe_m)
             acc_o = acc_o * alpha[:, None]
             l_i = l_i * alpha + l_ij
-            v_base_ptr = k_base_ptr + head_dim * stride_kv_d
-            v_ptrs = tl.make_block_ptr(
-                base=v_base_ptr,
-                shape=(BLOCK_SIZE_K, head_dim),
-                strides=(stride_kv_pos, stride_kv_d),
-                offsets=(0, 0),
-                block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
-                order=(1, 0),
-            )
-            v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
-            if USE_FP8:
+            if KV_LAYOUT is not None:
+                v = tl.load(
+                    v_cache_ptr
+                    + page[:, None] * KV_LAYOUT[4]
+                    + pid_kh * KV_LAYOUT[5]
+                    + page_offset[:, None] * KV_LAYOUT[6]
+                    + off_d[None, :] * KV_LAYOUT[7],
+                    mask=pos_mask[:, None] & (off_d[None, :] < head_dim),
+                    other=0.0,
+                )
+            else:
+                v_base_ptr = k_base_ptr + head_dim * stride_kv_d
+                v_ptrs = tl.make_block_ptr(
+                    base=v_base_ptr,
+                    shape=(BLOCK_SIZE_K, head_dim),
+                    strides=(stride_kv_pos, stride_kv_d),
+                    offsets=(0, 0),
+                    block_shape=(BLOCK_SIZE_K, BLOCK_SIZE_D),
+                    order=(1, 0),
+                )
+                v = tl.load(v_ptrs, boundary_check=(0, 1), padding_option="zero")
+            if USE_FP8 or KV_LAYOUT is not None:
                 v = v.to(q.dtype)
                 if KV_SCALE_MODE == 1:
-                    v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+                    v = (v * _scalar_scale(v_scale_ptr, V_SCALE_PTR)).to(q.dtype)
                 elif KV_SCALE_MODE == 2:
                     v_scale = tl.load(
                         v_scale_ptr
@@ -974,6 +1061,13 @@ def _gqa_sparse_decode_kernel(
     USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
     KV_SCALE_MODE: tl.constexpr,  # 0: none, 1: scalar, 2: [kv_head, token]
     USE_PDL: tl.constexpr,
+    v_cache_ptr=None,
+    KV_LAYOUT: tl.constexpr = None,
+    q_scale=1.0,
+    Q_SCALE_PTR: tl.constexpr = False,
+    K_SCALE_PTR: tl.constexpr = True,
+    V_SCALE_PTR: tl.constexpr = True,
+    STORE_LSE: tl.constexpr = True,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     # split-K over the topk dimension: pid(0) folds (query-token, chunk).
@@ -1019,28 +1113,49 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    if KV_LAYOUT is not None:
+        q = (q.to(tl.float32) * _scalar_scale(q_scale, Q_SCALE_PTR)).to(q.dtype)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     for _ in tl.range(chunk_start_topk, chunk_end_topk):
         blk = tl.load(cur_idx_ptr).to(tl.int32)
         cur_idx_ptr = cur_idx_ptr + stride_tk
         c = blk * BLOCK_SIZE_K
-        page = tl.load(bt_row + blk).to(tl.int64)
-        pos = c + off_n
-        pos_mask = pos < kv_len
-        k = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-            + off_n[None, :] * stride_kv_pos
-            + off_d[:, None] * stride_kv_d,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
+        if KV_LAYOUT is not None:
+            page, page_offset, pos_mask = _paged_sparse_block(
+                bt_row,
+                blk,
+                seq_len,
+                query_pos,
+                BLOCK_SIZE_K,
+                KV_LAYOUT,
+            )
+            k = tl.load(
+                kv_cache_ptr
+                + page[None, :] * stride_kv_blk
+                + pid_kh * stride_kv_h
+                + page_offset[None, :] * stride_kv_pos
+                + off_d[:, None] * stride_kv_d,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+        else:
+            page = tl.load(bt_row + blk).to(tl.int64)
+            pos = c + off_n
+            pos_mask = pos < kv_len
+            k = tl.load(
+                kv_cache_ptr
+                + page * stride_kv_blk
+                + pid_kh * stride_kv_h
+                + off_n[None, :] * stride_kv_pos
+                + off_d[:, None] * stride_kv_d,
+                mask=d_mask[:, None] & pos_mask[None, :],
+                other=0.0,
+            )
+        if USE_FP8 or KV_LAYOUT is not None:
             k = k.to(q.dtype)
             if KV_SCALE_MODE == 1:
-                k = (k * tl.load(k_scale_ptr)).to(q.dtype)
+                k = (k * _scalar_scale(k_scale_ptr, K_SCALE_PTR)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 k_scale = tl.load(
                     k_scale_ptr
@@ -1054,22 +1169,37 @@ def _gqa_sparse_decode_kernel(
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
         qk += tl.dot(q, k) * sm_scale_log2e
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp2(qk - m_ij[:, None])
+        if KV_LAYOUT is not None:
+            safe_m = tl.where(m_ij == float("-inf"), 0.0, m_ij)
+        else:
+            safe_m = m_ij
+        p = tl.exp2(qk - safe_m[:, None])
         l_ij = tl.sum(p, axis=1)
-        acc_o = acc_o * tl.exp2(m_i - m_ij)[:, None]
-        v = tl.load(
-            kv_cache_ptr
-            + page * stride_kv_blk
-            + pid_kh * stride_kv_h
-            + off_n[:, None] * stride_kv_pos
-            + (head_dim + off_d[None, :]) * stride_kv_d,
-            mask=pos_mask[:, None] & d_mask[None, :],
-            other=0.0,
-        )
-        if USE_FP8:
+        acc_o = acc_o * tl.exp2(m_i - safe_m)[:, None]
+        if KV_LAYOUT is not None:
+            v = tl.load(
+                v_cache_ptr
+                + page[:, None] * KV_LAYOUT[4]
+                + pid_kh * KV_LAYOUT[5]
+                + page_offset[:, None] * KV_LAYOUT[6]
+                + off_d[None, :] * KV_LAYOUT[7],
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+        else:
+            v = tl.load(
+                kv_cache_ptr
+                + page * stride_kv_blk
+                + pid_kh * stride_kv_h
+                + off_n[:, None] * stride_kv_pos
+                + (head_dim + off_d[None, :]) * stride_kv_d,
+                mask=pos_mask[:, None] & d_mask[None, :],
+                other=0.0,
+            )
+        if USE_FP8 or KV_LAYOUT is not None:
             v = v.to(q.dtype)
             if KV_SCALE_MODE == 1:
-                v = (v * tl.load(v_scale_ptr)).to(q.dtype)
+                v = (v * _scalar_scale(v_scale_ptr, V_SCALE_PTR)).to(q.dtype)
             elif KV_SCALE_MODE == 2:
                 v_scale = tl.load(
                     v_scale_ptr
@@ -1081,7 +1211,7 @@ def _gqa_sparse_decode_kernel(
                 v = (v * v_scale[:, None]).to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
-        lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
+        lse_i = safe_m + tl.log2(tl.exp2(lse_i - safe_m) + l_ij)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -1099,15 +1229,16 @@ def _gqa_sparse_decode_kernel(
         order=(1, 0),
     )
     tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
-    )
-    tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
+    if STORE_LSE:
+        lse_ptrs = tl.make_block_ptr(
+            base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+            shape=(gqa_group_size,),
+            strides=(stride_l_h,),
+            offsets=(0,),
+            block_shape=(BLOCK_SIZE_H,),
+            order=(0,),
+        )
+        tl.store(lse_ptrs, lse_i.to(lse_ptr.dtype.element_ty), boundary_check=(0,))
 
 
 @triton.heuristics(
@@ -1154,8 +1285,10 @@ def _merge_topk_attn_out_kernel(
     o = tl.load(o_ptrs, boundary_check=(0, 1), padding_option="zero")
     lse = tl.load(lse_ptrs)  # empty chunks contribute -inf -> weight 0
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp2(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    safe_max = tl.where(lse_max == float("-inf"), 0.0, lse_max)
+    weights = tl.exp2(lse - safe_max)
+    weight_sum = tl.sum(weights, axis=0)
+    weights = weights / tl.where(weight_sum > 0, weight_sum, 1.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     out_ptrs = (
         out_ptr + pid_b * stride_out_n + pid_h * stride_out_h + off_d * stride_out_d
