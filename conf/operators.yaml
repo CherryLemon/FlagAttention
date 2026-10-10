@@ -280,6 +280,7 @@ ops:
       - minimax_m3_index_score
       - minimax_m3_index_topk
       - minimax_m3_sparse_attn
+      - minimax_m3_sparse_attn_paged
     labels:
       - fused
       - Attention
@@ -294,6 +295,8 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_metax_public_exports
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_prefill_fp8
+      - tests/flag_attn/test_minimax_sparse_paged.py::test_numerical
+      - tests/flag_attn/test_minimax_sparse_paged.py::test_graph_replay_refreshes_metadata
     benchmark: benchmark/test_minimax_sparse_attention_benchmark.py
   - id: minimax_m3_sparse_attn_decode
     description: Run the MiniMax M3 sparse-attention decode and decode top-k paths.
@@ -301,6 +304,8 @@ ops:
       - minimax_m3_index_decode
       - minimax_m3_index_decode_score
       - minimax_m3_sparse_attn_decode
+      - minimax_m3_sparse_attn_decode_paged
+      - minimax_m3_sparse_decode_workspace
     labels:
       - fused
       - Attention
@@ -316,6 +321,8 @@ ops:
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_k16_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_topk_identity_out_and_score_out_bf16
       - tests/flag_attn/test_minimax_sparse_attention.py::test_decode_fp8
+      - tests/flag_attn/test_minimax_sparse_paged.py::test_fp8_scale_tensors
+      - tests/flag_attn/test_minimax_sparse_paged.py::test_empty_selected_blocks_zero_output
   - id: parallel_moba
     description: Run variable-length parallel MoBA attention.
     for:

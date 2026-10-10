@@ -48,12 +48,11 @@ from flag_attn.minimax_sparse_attention import (
 
 from flag_attn import testing  # noqa: F401
 
-_FLA_EXPORTS = {
+_OPERATOR_EXPORTS = {
     "chunk_log_linear_attn": (
         "flag_attn.FLA.log_linear_attn",
         "chunk_log_linear_attn",
     ),
-_OPERATOR_EXPORTS = {
     "chunk_gated_delta_rule": (
         "flag_attn.FLA.gated_delta_rule",
         "chunk_gated_delta_rule",
@@ -86,6 +85,9 @@ for _name in (
     "minimax_m3_index_topk",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "minimax_m3_sparse_attn_paged",
+    "minimax_m3_sparse_attn_decode_paged",
+    "minimax_m3_sparse_decode_workspace",
 ):
     _OPERATOR_EXPORTS[_name] = ("flag_attn.minimax_sparse_attention", _name)
 
@@ -131,5 +133,8 @@ __all__ = [
     "minimax_m3_index_topk",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "minimax_m3_sparse_attn_paged",
+    "minimax_m3_sparse_attn_decode_paged",
+    "minimax_m3_sparse_decode_workspace",
     "parallel_wall_attn",
 ]

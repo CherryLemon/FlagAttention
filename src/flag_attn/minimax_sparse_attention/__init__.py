@@ -22,6 +22,11 @@ The cache layout is compatible with vLLM:
 """
 
 from flag_attn.runtime.backend import is_metax_backend
+from .paged_kv import (
+    minimax_m3_sparse_attn_paged,
+    minimax_m3_sparse_attn_decode_paged,
+    minimax_m3_sparse_decode_workspace,
+)
 
 if is_metax_backend():
     from flag_attn.runtime.backend._metax.msa import (
@@ -51,4 +56,7 @@ __all__ = [
     "minimax_m3_index_topk",
     "minimax_m3_sparse_attn",
     "minimax_m3_sparse_attn_decode",
+    "minimax_m3_sparse_attn_paged",
+    "minimax_m3_sparse_attn_decode_paged",
+    "minimax_m3_sparse_decode_workspace",
 ]
